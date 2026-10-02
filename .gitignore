@@ -1,0 +1,7 @@
+node_modules/
+.data/
+# Datos de la primera versión (ficheros guardados en disco); la aplicación ya no usa esta carpeta
+files/
+.env*
+!.env.example
+.vercel

@@ -1,0 +1,16 @@
+{
+  "name": "lasterland",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Portapapeles y ficheros: pegar texto, guardarlo, subir y descargar ficheros",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env.local server.js"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
+  }
+}
