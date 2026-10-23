@@ -1,8 +1,13 @@
 const $ = (id) => document.getElementById(id);
 const text = $('text');
 const filename = $('filename');
-let knownFiles = [];
 let me = null;
+
+// Carpeta abierta (null es la raíz), su contenido y lo que hay seleccionado ("file:<id>" o "folder:<id>").
+let currentFolder = null;
+let knownFolders = [];
+let knownFiles = [];
+const selected = new Set();
 
 // --- utilidades ---
 
@@ -29,6 +34,7 @@ function timestamp() {
 }
 
 const contentUrl = (file) => `/api/files/${file.id}/content`;
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 // Cuenta los saltos de línea de value; si se pasa un límite, para en cuanto lo supera.
 function countNewlines(value, limit = Infinity) {
@@ -39,6 +45,7 @@ function countNewlines(value, limit = Infinity) {
 
 function button(label, onClick, className) {
   const b = document.createElement('button');
+  b.type = 'button';
   b.textContent = label;
   if (className) b.className = className;
   b.addEventListener('click', onClick);
@@ -73,27 +80,32 @@ async function api(method, path, body) {
 }
 
 // --- acceso ---
-// Primero se pide el usuario; según sea su primer acceso o no, se le pide la contraseña o que la elija.
+// Primero se pide el usuario; según sea su primer acceso o no, se le pide la contraseña o que la elija
+// (con el código de activación que le dio el administrador).
 
 let loginStep = 'user';
+let loginNeedsCode = false;
 
-function setLoginStep(step) {
+function setLoginStep(step, needsCode = false) {
   loginStep = step;
+  loginNeedsCode = needsCode;
   $('login-user').readOnly = step !== 'user';
   $('login-back').hidden = step === 'user';
   $('login-pass-row').hidden = step !== 'password';
+  $('login-code-row').hidden = step !== 'create' || !needsCode;
   $('login-new-row').hidden = step !== 'create';
   $('login-confirm-row').hidden = step !== 'create';
   $('login-hint').hidden = step !== 'create';
   $('login-submit').textContent = { user: 'Continuar', password: 'Entrar', create: 'Crear contraseña y entrar' }[step];
   $('login-error').textContent = '';
-  for (const id of ['login-pass', 'login-new', 'login-confirm']) $(id).value = '';
-  $({ user: 'login-user', password: 'login-pass', create: 'login-new' }[step]).focus();
+  for (const id of ['login-pass', 'login-code', 'login-new', 'login-confirm']) $(id).value = '';
+  $({ user: 'login-user', password: 'login-pass', create: needsCode ? 'login-code' : 'login-new' }[step]).focus();
 }
 
 function showLogin() {
   me = null;
   $('users-dialog').close();
+  $('move-dialog').close();
   $('app').hidden = true;
   $('login').hidden = false;
   setLoginStep('user');
@@ -102,16 +114,18 @@ function showLogin() {
 async function submitLogin() {
   const username = $('login-user').value.trim();
   if (loginStep === 'user') {
-    const { pending } = await api('POST', '/api/auth/check', { username });
-    return setLoginStep(pending ? 'create' : 'password');
+    const { pending, needsCode } = await api('POST', '/api/auth/check', { username });
+    return setLoginStep(pending ? 'create' : 'password', needsCode);
   }
   if (loginStep === 'password') {
     return enterApp(await api('POST', '/api/auth/login', { username, password: $('login-pass').value }));
   }
+  const code = $('login-code').value.trim();
   const password = $('login-new').value;
+  if (loginNeedsCode && !code) throw new Error('Escribe el código de activación');
   if (password.length < 8) throw new Error('La contraseña debe tener al menos 8 caracteres');
   if (password !== $('login-confirm').value) throw new Error('Las dos contraseñas no coinciden');
-  enterApp(await api('POST', '/api/auth/set-password', { username, password }));
+  enterApp(await api('POST', '/api/auth/activate', { username, code, password }));
 }
 
 $('login-form').addEventListener('submit', async (e) => {
@@ -141,17 +155,24 @@ function enterApp(user) {
 // Recargar la página vacía el texto y la lista del usuario que sale.
 $('logout').addEventListener('click', async () => {
   await api('POST', '/api/auth/logout').catch(() => {});
+  location.hash = '';
   location.reload();
 });
 
 // --- usuarios (solo administradores) ---
 // Se gestionan en un diálogo aparte. Sus avisos van dentro: el aviso general quedaría tapado por el diálogo.
 
-const NEW_USER_HINT = 'El usuario nuevo elige su contraseña la primera vez que entra.';
+const NEW_USER_HINT = 'Al crear un usuario recibirás su código de activación: dáselo junto con su nombre de usuario. Lo usará para elegir su contraseña la primera vez que entre.';
 
-function usersMessage(message, isError = false) {
-  $('users-message').textContent = message;
-  $('users-message').className = isError ? 'error' : 'muted';
+function usersMessage(message, isError = false, code = null) {
+  const el = $('users-message');
+  el.className = isError ? 'error' : 'muted';
+  el.textContent = message;
+  if (code) {
+    const chip = document.createElement('code');
+    chip.textContent = code;
+    el.append(' Código de activación: ', chip, ' (solo se muestra ahora).');
+  }
 }
 
 $('users-open').addEventListener('click', () => {
@@ -171,7 +192,7 @@ async function refreshUsers() {
   $('users').replaceChildren(...users.map((user) => tableRow([
     ['name', user.username],
     ['num', user.isAdmin ? 'Administrador' : 'Usuario'],
-    ['num', user.pending ? 'Pendiente de elegir contraseña' : 'Activo'],
+    ['num', user.pending ? 'Pendiente de activar' : 'Activo'],
     ['actions', user.id === me.id ? [] : [
       button('Restablecer contraseña', () => resetUser(user)),
       button('Borrar', () => removeUser(user), 'danger'),
@@ -181,8 +202,8 @@ async function refreshUsers() {
 
 async function userAction(request, message) {
   try {
-    await request();
-    usersMessage(message);
+    const result = await request();
+    usersMessage(message, false, result?.activationCode);
   } catch (err) {
     usersMessage(err.message, true);
   }
@@ -190,8 +211,8 @@ async function userAction(request, message) {
 }
 
 function resetUser(user) {
-  if (!confirm(`¿Restablecer la contraseña de "${user.username}"? Se cerrarán sus sesiones y elegirá una nueva al entrar.`)) return;
-  userAction(() => api('POST', `/api/users/${user.id}/reset`), `Contraseña de ${user.username} restablecida`);
+  if (!confirm(`¿Restablecer la contraseña de "${user.username}"? Se cerrarán sus sesiones y necesitará el código nuevo para elegir otra.`)) return;
+  userAction(() => api('POST', `/api/users/${user.id}/reset`), `Contraseña de ${user.username} restablecida.`);
 }
 
 function removeUser(user) {
@@ -203,9 +224,10 @@ $('user-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const username = $('user-name').value;
   await userAction(async () => {
-    await api('POST', '/api/users', { username, isAdmin: $('user-admin').checked });
+    const user = await api('POST', '/api/users', { username, isAdmin: $('user-admin').checked });
     e.target.reset();
-  }, `Usuario creado: ${username.trim().toLowerCase()}. Elegirá su contraseña la primera vez que entre.`);
+    return user;
+  }, `Usuario creado: ${username.trim().toLowerCase()}.`);
 });
 
 // --- nombre propuesto para el texto ---
@@ -340,7 +362,7 @@ async function openInEditor(file) {
   }
 }
 
-// --- ficheros ---
+// --- subir ---
 
 function confirmOverwrite(name) {
   return !knownFiles.some((f) => f.name === name) || confirm(`"${name}" ya existe. ¿Sobrescribir?`);
@@ -370,7 +392,7 @@ function sendBytes(target, blob, onProgress) {
 // El servidor decide adónde van los bytes: a él mismo o, si el fichero es grande, directo al almacén.
 async function upload(name, blob, onProgress) {
   try {
-    const { id, upload: target } = await api('POST', '/api/files', { name, size: blob.size });
+    const { id, upload: target } = await api('POST', '/api/files', { name, size: blob.size, folderId: currentFolder });
     await sendBytes(target, blob, onProgress);
     await api('POST', `/api/files/${id}/complete`);
   } catch (err) {
@@ -402,33 +424,56 @@ async function uploadFiles(fileList) {
   await refresh();
 }
 
+// --- carpetas, lista y selección ---
+
+const describe = ({ files, folders }) =>
+  [files && plural(files, 'fichero', 'ficheros'), folders && plural(folders, 'carpeta', 'carpetas')].filter(Boolean).join(' y ');
+
+function openFolder(id) {
+  currentFolder = id;
+  refresh();
+}
+
 async function removeFile(file) {
   if (!confirm(`¿Borrar "${file.name}"?`)) return;
+  await runAndRefresh(() => api('DELETE', `/api/files/${file.id}`), `Borrado: ${file.name}`);
+}
+
+async function removeFolder(folder) {
+  if (!confirm(`¿Borrar la carpeta "${folder.name}" con todo lo que contiene?`)) return;
+  await runAndRefresh(async () => `Borrada la carpeta ${folder.name}: ${describe(await api('DELETE', `/api/folders/${folder.id}`))}`);
+}
+
+async function runAndRefresh(request, message) {
   try {
-    await api('DELETE', `/api/files/${file.id}`);
-    notify(`Borrado: ${file.name}`);
+    const result = await request();
+    notify(message || result);
   } catch (err) {
     notify(err.message, true);
   }
   await refresh();
 }
 
+$('new-folder').addEventListener('click', async () => {
+  const name = prompt('Nombre de la carpeta nueva');
+  if (name === null || !name.trim()) return;
+  await runAndRefresh(() => api('POST', '/api/folders', { name, parentId: currentFolder }), `Carpeta creada: ${name.trim()}`);
+});
+
 // Cambia la celda del nombre por un campo editable: Intro guarda, Esc o salir del campo cancela.
-function startRename(file, cell) {
+function startRename(item, cell, save) {
   const input = document.createElement('input');
   input.type = 'text';
-  input.value = file.name;
+  input.value = item.name;
   input.spellcheck = false;
   let finished = false;
-  const finish = async (save) => {
+  const finish = async (commit) => {
     if (finished) return;
     finished = true;
     const name = input.value.trim();
-    if (save && name && name !== file.name) {
+    if (commit && name && name !== item.name) {
       try {
-        await api('PATCH', `/api/files/${file.id}`, { name });
-        // Si es el fichero abierto en el editor, guardar de nuevo debe ir al nombre nuevo.
-        if (!isNewDocument && filename.value === file.name) filename.value = name;
+        await save(name);
         notify(`Renombrado: ${name}`);
       } catch (err) {
         notify(err.message, true);
@@ -444,37 +489,160 @@ function startRename(file, cell) {
   cell.replaceChildren(input);
   input.focus();
   // Como en el Finder: se selecciona el nombre sin la extensión.
-  const dot = file.name.lastIndexOf('.');
-  input.setSelectionRange(0, dot > 0 ? dot : file.name.length);
+  const dot = item.name.lastIndexOf('.');
+  input.setSelectionRange(0, dot > 0 ? dot : item.name.length);
 }
 
-async function refresh() {
+async function renameFile(file, name) {
+  await api('PATCH', `/api/files/${file.id}`, { name });
+  // Si es el fichero abierto en el editor, guardar de nuevo debe ir al nombre nuevo.
+  if (!isNewDocument && filename.value === file.name) filename.value = name;
+}
+
+function renderCrumbs(path) {
+  const crumbs = [button('Inicio', () => openFolder(null), 'link')];
+  path.forEach((folder, i) => {
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = '›';
+    const last = i === path.length - 1;
+    const label = last ? Object.assign(document.createElement('span'), { className: 'current', textContent: folder.name }) : button(folder.name, () => openFolder(folder.id), 'link');
+    crumbs.push(sep, label);
+  });
+  if (!path.length) crumbs[0].className = 'current';
+  $('crumbs').replaceChildren(...crumbs);
+}
+
+function selectionKeys() {
+  const files = [], folders = [];
+  for (const key of selected) (key.startsWith('file:') ? files : folders).push(key.slice(key.indexOf(':') + 1));
+  return { files, folders };
+}
+
+function updateSelection() {
+  const total = knownFolders.length + knownFiles.length;
+  const all = $('select-all');
+  all.checked = total > 0 && selected.size === total;
+  all.indeterminate = selected.size > 0 && selected.size < total;
+  for (const row of $('files').children) row.classList.toggle('selected', selected.has(row.dataset.key));
+  $('selection').hidden = selected.size === 0;
+  $('selection-count').textContent = plural(selected.size, 'elemento seleccionado', 'elementos seleccionados');
+}
+
+function checkbox(key) {
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = selected.has(key);
+  box.addEventListener('change', () => {
+    box.checked ? selected.add(key) : selected.delete(key);
+    updateSelection();
+  });
+  return box;
+}
+
+$('select-all').addEventListener('change', (e) => {
+  selected.clear();
+  if (e.target.checked) {
+    for (const folder of knownFolders) selected.add(`folder:${folder.id}`);
+    for (const file of knownFiles) selected.add(`file:${file.id}`);
+  }
+  for (const box of $('files').querySelectorAll('td.check input')) box.checked = e.target.checked;
+  updateSelection();
+});
+$('clear-selection').addEventListener('click', () => {
+  selected.clear();
+  for (const box of $('files').querySelectorAll('td.check input')) box.checked = false;
+  updateSelection();
+});
+
+$('delete-selected').addEventListener('click', async () => {
+  const items = selectionKeys();
+  const warning = items.folders.length ? ' Las carpetas se borran con todo lo que contienen.' : '';
+  if (!confirm(`¿Borrar ${plural(selected.size, 'elemento', 'elementos')}?${warning}`)) return;
+  await runAndRefresh(async () => `Borrados: ${describe(await api('POST', '/api/batch/delete', items))}`);
+});
+
+// Mover: se elige la carpeta de destino entre todas las del usuario, menos las que se están moviendo.
+$('move-selected').addEventListener('click', async () => {
+  let folders;
   try {
-    knownFiles = await api('GET', '/api/files');
+    folders = await api('GET', '/api/folders');
   } catch (err) {
     return notify(err.message, true);
   }
-  $('files').replaceChildren(...knownFiles.map((file) => {
-    const download = document.createElement('a');
-    download.className = 'button';
-    download.href = contentUrl(file);
-    download.download = file.name;
-    download.textContent = 'Descargar';
+  const moving = new Set(selectionKeys().folders);
+  const movingPaths = folders.filter((f) => moving.has(f.id)).map((f) => f.path + '/');
+  const options = [{ id: '', path: '/ (Inicio)' }, ...folders.filter((f) => !moving.has(f.id) && !movingPaths.some((p) => f.path.startsWith(p))).map((f) => ({ id: f.id, path: '/' + f.path }))];
+  $('move-target').replaceChildren(...options.map((o) => Object.assign(document.createElement('option'), { value: o.id, textContent: o.path })));
+  $('move-target').value = currentFolder && options.some((o) => o.id === currentFolder) ? currentFolder : '';
+  $('move-dialog').showModal();
+});
+$('move-cancel').addEventListener('click', () => $('move-dialog').close());
+$('move-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('move-dialog').close();
+  const body = { ...selectionKeys(), folderId: $('move-target').value || null };
+  await runAndRefresh(async () => `Movidos: ${describe(await api('POST', '/api/batch/move', body))}`);
+});
 
-    const row = tableRow([
-      ['name', file.name],
-      ['num', formatSize(file.size)],
-      ['date', new Date(file.mtime).toLocaleString('es')],
-      ['actions', [
-        download,
-        button('Abrir en editor', () => openInEditor(file)),
-        button('Renombrar', () => startRename(file, row.firstChild)),
-        button('Borrar', () => removeFile(file), 'danger'),
-      ]],
-    ]);
-    return row;
-  }));
-  $('empty').hidden = knownFiles.length > 0;
+function fileRow(file) {
+  const download = document.createElement('a');
+  download.className = 'button';
+  download.href = contentUrl(file);
+  download.download = file.name;
+  download.textContent = 'Descargar';
+  const key = `file:${file.id}`;
+  const row = tableRow([
+    ['check', checkbox(key)],
+    ['name', file.name],
+    ['num', formatSize(file.size)],
+    ['date', new Date(file.mtime).toLocaleString('es')],
+    ['actions', [
+      download,
+      button('Abrir en editor', () => openInEditor(file)),
+      button('Renombrar', () => startRename(file, row.children[1], (name) => renameFile(file, name))),
+      button('Borrar', () => removeFile(file), 'danger'),
+    ]],
+  ]);
+  row.dataset.key = key;
+  return row;
+}
+
+function folderRow(folder) {
+  const key = `folder:${folder.id}`;
+  const open = button(`📁 ${folder.name}`, () => openFolder(folder.id), 'folder');
+  const row = tableRow([
+    ['check', checkbox(key)],
+    ['name', open],
+    ['num', '—'],
+    ['date', new Date(folder.mtime).toLocaleString('es')],
+    ['actions', [
+      button('Renombrar', () => startRename(folder, row.children[1], (name) => api('PATCH', `/api/folders/${folder.id}`, { name }))),
+      button('Borrar', () => removeFolder(folder), 'danger'),
+    ]],
+  ]);
+  row.dataset.key = key;
+  return row;
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await api('GET', currentFolder ? `/api/files?folder=${currentFolder}` : '/api/files');
+  } catch (err) {
+    // La carpeta ya no existe (borrada desde otra pestaña, enlace viejo…): vuelta a la raíz.
+    if (currentFolder && err.message === 'La carpeta no existe') return openFolder(null);
+    return notify(err.message, true);
+  }
+  knownFolders = data.folders;
+  knownFiles = data.files;
+  selected.clear();
+  history.replaceState(null, '', currentFolder ? `#f=${currentFolder}` : location.pathname);
+  renderCrumbs(data.path);
+  $('files').replaceChildren(...knownFolders.map(folderRow), ...knownFiles.map(fileRow));
+  $('empty').textContent = currentFolder ? 'Esta carpeta está vacía.' : 'Todavía no hay ficheros.';
+  $('empty').hidden = knownFolders.length + knownFiles.length > 0;
+  updateSelection();
 }
 $('refresh').addEventListener('click', refresh);
 
@@ -529,5 +697,7 @@ document.addEventListener('paste', (e) => {
 });
 
 // --- arranque ---
+// La carpeta abierta va en la URL (#f=…) para que una recarga vuelva a ella.
 
+currentFolder = (location.hash.match(/^#f=([0-9a-f-]{36})$/) || [])[1] || null;
 api('GET', '/api/me').then(enterApp, () => {});

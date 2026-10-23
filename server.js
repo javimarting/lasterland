@@ -13,6 +13,25 @@ const CONTENT_TYPES = {
   '.css': 'text/css; charset=utf-8',
 };
 
+// Cabeceras de seguridad para todas las respuestas. En Vercel, public/ lo sirve su CDN: las mismas
+// cabeceras están en vercel.json. connect-src incluye el almacén, al que el navegador sube directamente.
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': [
+    "default-src 'none'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self'",
+    "connect-src 'self' https://vercel.com",
+    "form-action 'self'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+  ].join('; '),
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+};
+
 // En Vercel los ficheros de public/ los sirve su CDN; esto es lo que los sirve en local.
 function serveStatic(req, res) {
   const { pathname } = new URL(req.url, 'http://localhost');
@@ -33,6 +52,7 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  for (const [header, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(header, value);
   if (req.url.startsWith('/api/')) return handleApi(req, res);
   serveStatic(req, res);
 });
